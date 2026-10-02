@@ -1,0 +1,7 @@
+interface:
+  display_name: "内测批量续卡skill"
+  short_description: "将原始签到记录整理为可导入的门店批量续卡 Excel 文件"
+  default_prompt: "使用 $internal-test-batch-renewal 将原始签到记录生成经过校验的批量续卡 Excel。"
+
+policy:
+  allow_implicit_invocation: true
