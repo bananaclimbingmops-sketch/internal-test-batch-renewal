@@ -45,6 +45,58 @@ function parseCardList(raw, fallback) {
   return cards;
 }
 
+function validateRule(rawRule, index) {
+  if (!rawRule || typeof rawRule !== "object" || Array.isArray(rawRule)) {
+    throw new Error(`规则第 ${index + 1} 项必须是对象`);
+  }
+  const card = normalize(rawRule.card);
+  const days = Number(rawRule.days);
+  const times = Number(rawRule.times);
+  if (!card) throw new Error(`规则第 ${index + 1} 项缺少 card`);
+  if (!Number.isInteger(days) || days < -1) {
+    throw new Error(`卡项“${card}”的 days 必须是大于等于 -1 的整数`);
+  }
+  if (!Number.isInteger(times) || times < 0) {
+    throw new Error(`卡项“${card}”的 times 必须是大于等于 0 的整数`);
+  }
+  if (days === 0 && times === 0) {
+    throw new Error(`卡项“${card}”的 days 和 times 不能同时为 0`);
+  }
+  return { card, days, times };
+}
+
+async function loadRules(args) {
+  if (args["rules-json"]) {
+    if (args["duration-cards"] !== undefined || args["count-cards"] !== undefined) {
+      throw new Error("--rules-json 不能与 --duration-cards 或 --count-cards 同时使用");
+    }
+    const rulesPath = path.resolve(args["rules-json"]);
+    const parsed = JSON.parse(await fs.readFile(rulesPath, "utf8"));
+    const rawRules = Array.isArray(parsed) ? parsed : parsed.rules;
+    if (!Array.isArray(rawRules) || !rawRules.length) {
+      throw new Error("规则文件必须是非空数组，或包含非空 rules 数组");
+    }
+    const rules = rawRules.map(validateRule);
+    if (new Set(rules.map((rule) => rule.card)).size !== rules.length) {
+      throw new Error("规则文件包含重复卡项");
+    }
+    return { rules, rulesPath, mode: "custom" };
+  }
+
+  const durationCards = parseCardList(args["duration-cards"], defaultDurationCards);
+  const countCards = parseCardList(args["count-cards"], defaultCountCards);
+  const overlap = durationCards.filter((card) => countCards.includes(card));
+  if (overlap.length) throw new Error(`期限卡与次卡列表重叠：${overlap.join(", ")}`);
+  return {
+    rules: [
+      ...durationCards.map((card) => ({ card, days: 1, times: 0 })),
+      ...countCards.map((card) => ({ card, days: -1, times: 1 })),
+    ],
+    rulesPath: null,
+    mode: "legacy",
+  };
+}
+
 function columnName(index) {
   let value = index + 1;
   let result = "";
@@ -60,6 +112,10 @@ function normalize(value) {
   return String(value ?? "").trim();
 }
 
+function isPlaceholder(value) {
+  return ["-", "—", "－"].includes(normalize(value));
+}
+
 function findHeaderIndex(header, aliases) {
   for (const alias of aliases) {
     const index = header.indexOf(alias);
@@ -70,7 +126,6 @@ function findHeaderIndex(header, aliases) {
 
 function sameEntry(left, right) {
   return left.card === right.card
-    && left.action === right.action
     && left.name === right.name
     && left.phone === right.phone;
 }
@@ -95,15 +150,105 @@ function findSourceData(workbook) {
   throw new Error("没有找到同时包含“用户卡ID、成员姓名、手机号码、签到卡/签到卡类”的工作表");
 }
 
-function collectRows(sourceData, durationCards, countCards) {
-  const durationSet = new Set(durationCards);
-  const countSet = new Set(countCards);
-  const overlap = durationCards.filter((card) => countSet.has(card));
-  if (overlap.length) throw new Error(`期限卡与次卡列表重叠：${overlap.join(", ")}`);
+function inspectSourceData(sourceData) {
+  const cardStats = new Map();
+  const seen = new Map();
+  const missingFields = [];
+  const conflicts = [];
+  let blankRowsSkipped = 0;
+  let placeholderRowsSkipped = 0;
+  let duplicatesSkipped = 0;
 
-  const categoryOrder = new Map(
-    [...durationCards, ...countCards].map((card, index) => [card, index]),
-  );
+  for (const [offset, row] of sourceData.values.slice(1).entries()) {
+    const sourceRow = offset + 2;
+    const entry = {
+      sourceRow,
+      sourceOrder: offset,
+      id: normalize(row[sourceData.indexes.id]),
+      name: normalize(row[sourceData.indexes.name]),
+      phone: normalize(row[sourceData.indexes.phone]),
+      card: normalize(row[sourceData.indexes.card]),
+    };
+    if (!entry.id && !entry.name && !entry.phone && !entry.card) {
+      blankRowsSkipped += 1;
+      continue;
+    }
+    if (isPlaceholder(entry.card)) {
+      placeholderRowsSkipped += 1;
+      continue;
+    }
+
+    const missing = [
+      !entry.id || isPlaceholder(entry.id) ? "用户卡ID" : null,
+      !entry.name || isPlaceholder(entry.name) ? "成员姓名" : null,
+      !entry.phone || isPlaceholder(entry.phone) ? "手机号码" : null,
+      !entry.card ? "签到卡/签到卡类" : null,
+    ].filter(Boolean);
+    if (missing.length) {
+      missingFields.push({ row: sourceRow, missing });
+    }
+    if (!entry.card) continue;
+    if (!cardStats.has(entry.card)) {
+      cardStats.set(entry.card, {
+        card: entry.card,
+        firstSourceRow: sourceRow,
+        occurrences: 0,
+        uniqueIds: new Set(),
+      });
+    }
+    const stats = cardStats.get(entry.card);
+    stats.occurrences += 1;
+    if (entry.id && !isPlaceholder(entry.id)) stats.uniqueIds.add(entry.id);
+
+    if (!entry.id || isPlaceholder(entry.id)) continue;
+    if (seen.has(entry.id)) {
+      const prior = seen.get(entry.id);
+      if (sameEntry(prior, entry)) {
+        duplicatesSkipped += 1;
+      } else {
+        conflicts.push({ id: entry.id, first: prior, duplicate: entry });
+      }
+      continue;
+    }
+    seen.set(entry.id, entry);
+  }
+
+  return {
+    mode: "inspect",
+    sourceSheet: sourceData.sheet.name,
+    sourceRows: Math.max(0, sourceData.values.length - 1),
+    nonblankUniqueIds: seen.size,
+    blankRowsSkipped,
+    placeholderRowsSkipped,
+    duplicatesSkipped,
+    cardItems: [...cardStats.values()].map((item) => ({
+      card: item.card,
+      occurrences: item.occurrences,
+      uniqueUserCardIds: item.uniqueIds.size,
+      firstSourceRow: item.firstSourceRow,
+    })),
+    issues: {
+      missingFieldRows: missingFields.length,
+      missingFields: missingFields.slice(0, 20),
+      conflictingIds: conflicts.length,
+      conflicts: conflicts.slice(0, 20).map((item) => ({
+        id: item.id,
+        firstRow: item.first.sourceRow,
+        duplicateRow: item.duplicate.sourceRow,
+        firstCard: item.first.card,
+        duplicateCard: item.duplicate.card,
+        firstName: item.first.name,
+        duplicateName: item.duplicate.name,
+        firstPhone: item.first.phone,
+        duplicatePhone: item.duplicate.phone,
+      })),
+    },
+  };
+}
+
+function collectRows(sourceData, rules) {
+  const rulesByCard = new Map(rules.map((rule) => [rule.card, rule]));
+  const categoryOrder = new Map(rules.map((rule, index) => [rule.card, index]));
   const seen = new Map();
   const selected = [];
   const conflicts = [];
@@ -112,8 +257,8 @@ function collectRows(sourceData, durationCards, countCards) {
   for (const [offset, row] of sourceData.values.slice(1).entries()) {
     const sourceRow = offset + 2;
     const card = normalize(row[sourceData.indexes.card]);
-    const action = durationSet.has(card) ? "duration" : countSet.has(card) ? "count" : null;
-    if (!action) continue;
+    const rule = rulesByCard.get(card);
+    if (!rule) continue;
 
     const entry = {
       sourceRow,
@@ -122,7 +267,7 @@ function collectRows(sourceData, durationCards, countCards) {
       name: normalize(row[sourceData.indexes.name]),
       phone: normalize(row[sourceData.indexes.phone]),
       card,
-      action,
+      rule,
     };
 
     if (!entry.id) throw new Error(`源表“${sourceData.sheet.name}”第 ${sourceRow} 行缺少用户卡ID`);
@@ -159,7 +304,15 @@ function collectRows(sourceData, durationCards, countCards) {
   }
 
   if (!selected.length) {
-    throw new Error("没有任何记录精确命中目标期限卡或次卡");
+    throw new Error("没有任何记录精确命中用户确认的续卡卡项");
+  }
+
+  const matchedCards = new Set(selected.map((entry) => entry.card));
+  const unmatchedCards = rules
+    .map((rule) => rule.card)
+    .filter((card) => !matchedCards.has(card));
+  if (unmatchedCards.length) {
+    throw new Error(`用户确认的卡项在源表中没有匹配记录：${unmatchedCards.join("、")}`);
   }
 
   selected.sort((left, right) => {
@@ -208,14 +361,14 @@ async function loadArtifactTool(nodeModulesPath) {
   return import(pathToFileURL(modulePath).href);
 }
 
-async function renderPreviews(workbook, previewDir, sheetName, rowCount, firstCountRow) {
+async function renderPreviews(workbook, previewDir, sheetName, rowCount, boundaryRow) {
   if (!previewDir) return [];
   await fs.mkdir(previewDir, { recursive: true });
   const ranges = [
     ["top.png", "A1:G20"],
     [
       "boundary.png",
-      `A${Math.max(1, firstCountRow - 3)}:G${Math.min(rowCount, firstCountRow + 7)}`,
+      `A${Math.max(1, boundaryRow - 3)}:G${Math.min(rowCount, boundaryRow + 7)}`,
     ],
     ["bottom.png", `A${Math.max(1, rowCount - 14)}:G${rowCount}`],
   ];
@@ -236,29 +389,35 @@ async function renderPreviews(workbook, previewDir, sheetName, rowCount, firstCo
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  const mode = normalize(args.mode || "build").toLowerCase();
+  if (!["inspect", "build"].includes(mode)) {
+    throw new Error("--mode 只能是 inspect 或 build");
+  }
   const nodeModulesPath = path.resolve(required(args, "node-modules"));
   const sourcePath = path.resolve(required(args, "source"));
+  if (path.extname(sourcePath).toLowerCase() !== ".xlsx") {
+    throw new Error("原始签到记录必须是 .xlsx 文件");
+  }
+  await fs.access(sourcePath);
+  const { FileBlob, SpreadsheetFile } = await loadArtifactTool(nodeModulesPath);
+  const sourceWorkbook = await SpreadsheetFile.importXlsx(await FileBlob.load(sourcePath));
+  const sourceData = findSourceData(sourceWorkbook);
+  if (mode === "inspect") {
+    console.log(JSON.stringify(inspectSourceData(sourceData), null, 2));
+    return;
+  }
+
   const outputPath = path.resolve(required(args, "output"));
   const reason = required(args, "reason");
   const templatePath = path.resolve(args.template ?? defaultTemplatePath);
   const previewDir = args["preview-dir"] ? path.resolve(args["preview-dir"]) : null;
-  const durationCards = parseCardList(args["duration-cards"], defaultDurationCards);
-  const countCards = parseCardList(args["count-cards"], defaultCountCards);
-
-  if (path.extname(sourcePath).toLowerCase() !== ".xlsx") {
-    throw new Error("原始签到记录必须是 .xlsx 文件");
-  }
   if (path.extname(outputPath).toLowerCase() !== ".xlsx") {
     throw new Error("输出路径必须以 .xlsx 结尾");
   }
-
-  await fs.access(sourcePath);
   await fs.access(templatePath);
-  const { FileBlob, SpreadsheetFile } = await loadArtifactTool(nodeModulesPath);
-
-  const sourceWorkbook = await SpreadsheetFile.importXlsx(await FileBlob.load(sourcePath));
-  const sourceData = findSourceData(sourceWorkbook);
-  const { selected, duplicatesSkipped } = collectRows(sourceData, durationCards, countCards);
+  const { rules, rulesPath, mode: rulesMode } = await loadRules(args);
+  const rulesByCard = new Map(rules.map((rule) => [rule.card, rule]));
+  const { selected, duplicatesSkipped } = collectRows(sourceData, rules);
 
   const templateWorkbook = await SpreadsheetFile.importXlsx(await FileBlob.load(templatePath));
   const mainSheet = templateWorkbook.worksheets.items.find(
@@ -274,8 +433,8 @@ async function main() {
       entry.name,
       entry.phone,
       entry.card,
-      entry.action === "duration" ? 1 : -1,
-      entry.action === "count" ? 1 : 0,
+      entry.rule.days,
+      entry.rule.times,
       reason,
     ]),
   ];
@@ -311,8 +470,6 @@ async function main() {
   const dataRows = verifiedValues.slice(1).filter((row) => normalize(row[0]));
   const seenIds = new Set();
   const invalidRows = [];
-  const durationSet = new Set(durationCards);
-  const countSet = new Set(countCards);
   for (const [index, row] of dataRows.entries()) {
     const id = normalize(row[0]);
     const name = normalize(row[1]);
@@ -323,9 +480,8 @@ async function main() {
     const rowReason = normalize(row[6]);
     const duplicate = seenIds.has(id);
     seenIds.add(id);
-    const validAction = durationSet.has(card)
-      ? days === 1 && times === 0
-      : countSet.has(card) && days === -1 && times === 1;
+    const rule = rulesByCard.get(card);
+    const validAction = Boolean(rule) && days === rule.days && times === rule.times;
     if (!id || !name || !phone || !validAction || rowReason !== reason || duplicate) {
       invalidRows.push({
         row: index + 2,
@@ -358,14 +514,16 @@ async function main() {
     throw new Error("模板的其他工作表在导出后发生了变化");
   }
 
-  const firstCountIndex = selected.findIndex((entry) => entry.action === "count");
-  const firstCountRow = firstCountIndex >= 0 ? firstCountIndex + 2 : outputRows.length;
+  const firstBoundaryIndex = selected.findIndex(
+    (entry, index) => index > 0 && entry.card !== selected[0].card,
+  );
+  const boundaryRow = firstBoundaryIndex >= 0 ? firstBoundaryIndex + 2 : outputRows.length;
   const previews = await renderPreviews(
     verifiedWorkbook,
     previewDir,
     mainSheet.name,
     outputRows.length,
-    firstCountRow,
+    boundaryRow,
   );
 
   const summary = {
@@ -373,16 +531,18 @@ async function main() {
     sourceSheet: sourceData.sheet.name,
     reason,
     outputRows: selected.length,
-    durationRows: selected.filter((entry) => entry.action === "duration").length,
-    countRows: selected.filter((entry) => entry.action === "count").length,
     duplicatesSkipped,
+    rulesMode,
+    rulesPath,
+    rules,
     cardCounts: Object.fromEntries(
-      [...durationCards, ...countCards].map((card) => [
-        card,
-        selected.filter((entry) => entry.card === card).length,
+      rules.map((rule) => [
+        rule.card,
+        selected.filter((entry) => entry.card === rule.card).length,
       ]),
     ),
-    countCardRule: { days: -1, times: 1, permanent: true },
+    rowsWithDayChange: selected.filter((entry) => entry.rule.days !== 0).length,
+    rowsWithTimeChange: selected.filter((entry) => entry.rule.times !== 0).length,
     formulaErrors: [],
     otherSheetsPreserved: true,
     previews,
