@@ -1,103 +1,92 @@
 ---
 name: internal-test-batch-renewal
-description: 将香蕉攀岩门店的原始签到记录 Excel 先清洗并列出实际出现的卡项，向用户确认需续卡的卡项及各自新增天数/次数后，再生成经过校验的批量续卡模板。适用于内测、试营业或活动后的批量续期与加次；不用于普通签到排序或其他会员资产清洗。
+description: 将香蕉攀岩门店的原始签到记录 Excel 清洗并列出实际卡项，向用户确认逐卡新增天数和次数后生成批量续卡模板。适用于 Codex、CodeBuddy、Claude Code、Cursor 等能运行 Python 3 的 Agent 环境；不用于普通签到排序或其他会员资产清洗。
 ---
 
 # 内测批量续卡
 
-把原始签到记录转换为经过用户确认、可导入后台的批量续卡 Excel。默认采用“先盘点卡项、再确认规则、最后导出”的两阶段流程，避免 Agent 根据卡名自行猜测续卡范围或续卡数值。
+采用“盘点卡项 → 用户确认 → 生成 Excel”的两阶段流程。默认运行无需第三方包的 Python 便携后端，不要假设环境中存在 Codex 私有依赖。
 
-## 输入
+## 环境选择
 
-第一阶段必须具备：
+优先使用 [scripts/build_batch_renewal.py](scripts/build_batch_renewal.py)：
 
-- 原始签到记录 `.xlsx`
+- 仅要求 Python 3.8 或更高版本。
+- 只使用 Python 标准库，不需要联网、`pip install`、Node.js 或 `@oai/artifact-tool`。
+- macOS/Linux 优先尝试 `python3`，Windows 或没有 `python3` 时尝试 `python`。
 
-第二阶段必须由用户明确提供：
+Codex 环境可以选用 [scripts/build_batch_renewal.mjs](scripts/build_batch_renewal.mjs) 获得 PNG 预览，但它需要 Codex 工作区提供的 `@oai/artifact-tool`。不要在 CodeBuddy 或普通沙箱中选择 Node 后端，除非已经确认该依赖存在。
 
-- 需要续卡的卡项
-- 每个卡项的 `新增天数`
-- 每个卡项的 `新增次数`
-- 本次续卡原因
+如果 Python 和 Codex 增强后端都不可用，停止并报告缺失的运行环境，不要静默改用手工复制。
 
-如果用户在首次请求中已经完整列出以上规则，可以跳过反问，直接进入生成阶段。否则必须先完成卡项盘点并询问用户，不能沿用历史任务、默认卡项或根据名称自行决定。
+## 第一阶段：清洗并盘点
 
-源表默认从表头识别 `用户卡ID`、`成员姓名`、`手机号码`，卡项列可为 `签到卡` 或 `签到卡类`。如果工作簿有多个工作表，选择第一个同时包含这些字段的表。
+运行只读命令：
 
-## 两阶段流程
+```bash
+python3 scripts/build_batch_renewal.py \
+  --mode inspect \
+  --source "/absolute/path/签到记录.xlsx"
+```
 
-### 第一阶段：清洗并盘点卡项
+向用户展示：
 
-1. 加载工作区 Node.js 和 `node_modules` 依赖。
-2. 以只读方式运行 [scripts/build_batch_renewal.mjs](scripts/build_batch_renewal.mjs)：
+- 每个真实卡项的完整名称
+- 出现行数
+- 唯一用户卡 ID 数
+- 空白行、`-` 等占位行、完全重复行、缺失字段行和冲突 ID 数
 
-   ```bash
-   "<node_path>" scripts/build_batch_renewal.mjs \
-     --mode inspect \
-     --node-modules "<node_modules_path>" \
-     --source "/absolute/path/签到记录.xlsx"
-   ```
+占位行不作为真实卡项。只列出源表实际出现的卡项，卡名必须完整展示。
 
-3. 向用户展示脚本返回的卡项列表，至少包含：
-   - 卡项完整名称
-   - 出现行数
-   - 唯一用户卡 ID 数
-4. 同时报告空白行、`-` 等无卡项占位行、完全重复行、缺失字段行和冲突用户卡 ID 数。占位行不作为真实卡项展示；存在缺失或冲突时要说明这些记录可能阻止最终生成。
-5. 暂停，不生成 Excel。询问用户：
-   - 哪些卡项需要续卡
-   - 每个卡项新增多少天
-   - 每个卡项新增多少次
-   - 续卡原因
-
-使用便于直接回答的格式，例如：
+如果用户首次请求没有给出完整规则，暂停生成并询问：
 
 ```text
-请按下面格式回复需要续卡的卡项：
+请确认需要续卡的卡项：
 月卡：新增天数 1，新增次数 0
 10次卡：新增天数 -1，新增次数 1
 续卡原因：10.1悠方店内测续卡
 ```
 
-只列出源表实际出现的卡项。不要用模糊、包含或正则匹配替代完整名称。
+每个卡项都要确认 `新增天数` 和 `新增次数`。如果用户只说“次卡加次”但没有说明是否永久有效，必须追问；用户要求永久有效时使用 `新增天数 = -1`。
 
-### 第二阶段：按确认规则生成
+## 第二阶段：按确认规则生成
 
-1. 把用户确认的规则写入临时 JSON 文件：
+把用户确认的规则写入临时 JSON：
 
-   ```json
-   {
-     "rules": [
-       { "card": "月卡", "days": 1, "times": 0 },
-       { "card": "10次卡", "days": -1, "times": 1 }
-     ]
-   }
-   ```
+```json
+{
+  "rules": [
+    { "card": "月卡", "days": 1, "times": 0 },
+    { "card": "10次卡", "days": -1, "times": 1 }
+  ]
+}
+```
 
-2. 每个规则必须满足：
-   - `card` 是第一阶段列出的完整卡项名称
-   - `days` 是大于等于 `-1` 的整数
-   - `times` 是大于等于 `0` 的整数
-   - `days` 和 `times` 不能同时为 `0`
-3. 如果用户只说“次卡增加次数”但没有说明是否永久有效，必须追问；不能自行把新增天数设为 `0`。当用户要求次卡永久有效时，使用 `days = -1`。
-4. 在首次写入前，按 Spreadsheets skill 要求运行一次 artifact operation marker，操作类型为 `create`，输出数为 1，格式为 `xlsx`。
-5. 运行生成命令：
+规则要求：
 
-   ```bash
-   "<node_path>" scripts/build_batch_renewal.mjs \
-     --mode build \
-     --node-modules "<node_modules_path>" \
-     --source "/absolute/path/签到记录.xlsx" \
-     --output "/absolute/path/outputs/内测批量续卡.xlsx" \
-     --reason "10.1悠方店内测续卡" \
-     --rules-json "/absolute/path/work/renewal-rules.json" \
-     --preview-dir "/absolute/path/work/previews"
-   ```
+- `card` 必须与盘点结果中的完整名称精确一致。
+- `days` 是大于等于 `-1` 的整数。
+- `times` 是大于等于 `0` 的整数。
+- 两者不能同时为 `0`。
 
-脚本默认使用 [assets/batch-renewal-template.xlsx](assets/batch-renewal-template.xlsx)。只有用户提供另一份明确模板时，才传入 `--template "/absolute/path/template.xlsx"`。
+生成：
 
-## 输出规则
+```bash
+python3 scripts/build_batch_renewal.py \
+  --mode build \
+  --source "/absolute/path/签到记录.xlsx" \
+  --output "/absolute/path/内测批量续卡.xlsx" \
+  --reason "10.1悠方店内测续卡" \
+  --rules-json "/absolute/path/renewal-rules.json"
+```
 
-输出主表列顺序：
+脚本默认使用 [assets/batch-renewal-template.xlsx](assets/batch-renewal-template.xlsx)。只有用户明确提供其他模板时才添加 `--template`。
+
+若所在 Agent 对文件创建有自己的标记、审批或交付规范，遵守宿主环境规范；这些规范不是便携脚本自身的运行依赖。Codex 中生成 Excel 时仍应遵守可用的 Spreadsheets skill。
+
+## 输出和排序
+
+主表固定包含：
 
 1. `用户卡ID`
 2. `成员姓名`
@@ -107,50 +96,39 @@ description: 将香蕉攀岩门店的原始签到记录 Excel 先清洗并列出
 6. `新增次数`
 7. `续卡原因`
 
-每条记录使用该卡项在规则 JSON 中对应的 `days` 和 `times`。姓名和手机号按签到记录原样保留，包括脱敏星号。用户卡 ID 和手机号按文本写入，避免数字格式或科学计数法改变内容。
-
-忽略用户没有选择的卡项。输出顺序按规则 JSON 中的卡项顺序分组；同一卡项内保留源表顺序。
+用户卡 ID、姓名、手机号和卡项按文本写入；天数和次数按整数写入。忽略用户未选择的卡项。按规则 JSON 的卡项顺序分组，同一卡项内保留源表顺序。
 
 ## 数据完整性
 
-使用 `用户卡ID` 作为唯一键。
+- 目标记录缺少用户卡 ID、姓名或手机号：停止并报告源行。
+- 同一用户卡 ID 完全重复：只保留第一条并报告跳过数量。
+- 同一用户卡 ID 对应不同卡项、姓名或手机号：停止并报告冲突。
+- 用户选择了源表不存在的卡项：停止并报告。
+- 输出后重新打开文件，校验表头、记录数、逐卡规则、重复 ID、续卡原因和公式错误。
+- 模板主工作表以外的 ZIP 部件必须保持逐字节不变。
 
-- 用户卡 ID 缺失：目标卡项命中该行时停止并报告源行。
-- 卡项为空或以 `-`、`—`、`－` 占位：盘点时忽略，不作为可选卡项。
-- 同一用户卡 ID 完全重复：只保留首次出现的一条，并在摘要中报告跳过数量。
-- 同一用户卡 ID 对应不同卡项、不同姓名或不同手机号：停止并列出冲突，不能静默选择。
-- 目标记录缺少成员姓名或手机号码：停止并报告。
-- 用户选择了源表不存在的卡项：没有匹配记录时停止并报告。
+## 旧版规则兼容
 
-## 兼容旧版固定规则
+用户明确要求直接使用旧规则时，可以不传 `--rules-json`：
 
-在明确需要跳过卡项确认、直接使用旧规则时，可以不传 `--rules-json`：
+- `新人月卡、月卡、季卡、年卡`：新增天数 `1`，新增次数 `0`
+- `10次卡、20次卡`：新增天数 `-1`，新增次数 `1`
 
-- 期限卡默认：`新人月卡`、`月卡`、`季卡`、`年卡`，新增天数 `1`、新增次数 `0`
-- 次卡默认：`10次卡`、`20次卡`，新增天数 `-1`、新增次数 `1`
+可以通过 `--duration-cards` 和 `--count-cards` 覆盖旧版卡项。交互式流程仍优先使用 `--rules-json`。
 
-也可以覆盖旧版卡项：
+## Codex 增强后端
+
+只有确认存在 Codex 工作区 Node.js 与 `@oai/artifact-tool` 时才使用：
 
 ```bash
---duration-cards "新人月卡,月卡,季卡,年卡" \
---count-cards "10次卡,20次卡"
+"<node_path>" scripts/build_batch_renewal.mjs \
+  --mode inspect \
+  --node-modules "<node_modules_path>" \
+  --source "/absolute/path/签到记录.xlsx"
 ```
 
-交互式两阶段流程优先使用 `--rules-json`。`--rules-json` 不能与 `--duration-cards` 或 `--count-cards` 同时使用。
+生成阶段参数与 Python 后端相同，另外需要 `--node-modules`，可选 `--preview-dir`。Node 后端不是跨 Agent 的必需依赖。
 
-## 校验
+## 交付
 
-脚本会在导出后重新打开成品并验证：
-
-- 输出记录数等于去重后的目标用户数
-- 用户卡 ID 唯一且非空
-- 姓名、手机号、卡项类别、续卡原因非空
-- 每个卡项的新增天数和新增次数与用户确认规则完全一致
-- 不含公式错误
-- 模板的其他工作表保持不变
-
-必须查看脚本生成的顶部、卡项分组交界和底部预览。若列标题、负号、手机号、卡项或备注被截断，修正后重新导出并验证。
-
-最终只向用户交付一个 `.xlsx` 文件，并简要报告每个卡项的输出数量、去重数量和任何被阻止的异常。不要把预览、规则 JSON、审计数据或脚本作为业务输出交付。
-
-如果 Artifact Tool 在输出目录旁生成 `.inspect.ndjson`，将其移到工作目录或排除在交付之外。
+最终只交付生成的 `.xlsx`，并报告每个卡项的输出数量、去重数量和被阻止的异常。不要交付临时规则 JSON、预览或审计文件。

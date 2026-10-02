@@ -1,7 +1,7 @@
 interface:
   display_name: "内测批量续卡skill"
-  short_description: "先盘点卡项并确认规则，再生成批量续卡 Excel"
-  default_prompt: "使用 $internal-test-batch-renewal 清洗这份签到记录，列出实际卡项并向我确认逐卡续卡规则后生成最终 Excel。"
+  short_description: "跨 Agent 盘点卡项、确认规则并生成续卡 Excel"
+  default_prompt: "使用 $internal-test-batch-renewal 的便携后端清洗签到记录，列出实际卡项，向我确认逐卡续卡规则后生成最终 Excel。"
 
 policy:
   allow_implicit_invocation: true
